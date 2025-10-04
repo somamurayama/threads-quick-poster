@@ -49,21 +49,43 @@ export default async function handler(req, res) {
       let mediaUrl = '';
 
       if (mode === 'TEMPLATE' || mode === 'MIX' || mode === 'AI') {
-        // templates から重み付きランダム（簡易：weight降順→ランダム）
-        const { data: tmps, error: errT } = await supabase
-          .from('templates')
-          .select('id, body, weight, media_url')
-          .order('weight', { ascending: false })
-          .limit(50);
-        if (errT) throw errT;
+        if (mode === 'TEMPLATE' || mode === 'MIX' || mode === 'AI') {
+  // --- pick_next_template 関数を呼び出して、未使用テンプレを取得する ---
+  const rpcUrl = process.env.SUPABASE_URL + '/rest/v1/rpc/pick_next_template';
+  const rpcRes = await fetch(rpcUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'apikey': process.env.SUPABASE_SERVICE_ROLE,
+      'Authorization': 'Bearer ' + process.env.SUPABASE_SERVICE_ROLE,
+    },
+    body: JSON.stringify({ _account_id: acct.id }),
+  });
+  if (!rpcRes.ok) throw new Error('pick_next_template failed: ' + (await rpcRes.text()));
 
-        if (tmps && tmps.length > 0) {
-          const pick = tmps[Math.floor(Math.random() * tmps.length)];
-          text = pick.body;
-          mediaUrl = pick.media_url || '';
-        } else {
-          text = 'Hello from scheduler 🎯';
-        }
+  const templateId = await rpcRes.json();
+
+  // テンプレート本体を取得
+  const tRes = await fetch(
+    `${process.env.SUPABASE_URL}/rest/v1/templates?id=eq.${templateId}`,
+    {
+      headers: {
+        'apikey': process.env.SUPABASE_SERVICE_ROLE,
+        'Authorization': 'Bearer ' + process.env.SUPABASE_SERVICE_ROLE,
+      },
+    }
+  );
+  const [tpl] = await tRes.json();
+
+  if (!tpl) {
+    text = '（テンプレートが見つかりません）';
+    mediaUrl = '';
+  } else {
+    text = tpl.body || '（本文なし）';
+    mediaUrl = tpl.media_url || '';
+  }
+}
+
 
         // AIモードが指定されており OPENAI_API_KEY がある場合は、上書き生成（任意）
         if (mode !== 'TEMPLATE' && process.env.OPENAI_API_KEY) {
