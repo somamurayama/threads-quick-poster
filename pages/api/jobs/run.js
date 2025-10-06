@@ -1,9 +1,41 @@
 // pages/api/jobs/run.js
-// 自動投稿ジョブ（Threads 複数画像 + 時間帯フィルタ[time_start/time_end]対応）
+// 自動投稿ジョブ（Threads 複数画像 + 時間帯フィルタ[time_start/time_end]対応 + 429対策）
 // 使い方: https://<あなたのURL>/api/jobs/run?key=YOUR_SECRET[&dry=1]
 
 import { supabase } from '../../../lib/db.js';
 import { createTextAndMaybePublish, createImageContainer, publish } from '../../../lib/threadsApi.js';
+
+/** ---- レート制限対策ユーティリティ ---- */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** fetch で 429/5xx を指数バックオフ付きでリトライ */
+async function safeFetch(url, options, { max = 4, base = 800 } = {}) {
+  let attempt = 0;
+  for (;;) {
+    const res = await fetch(url, options);
+    if (res.status !== 429 && res.status < 500) return res; // 成功 or 4xx(429以外)は即返す
+    if (attempt >= max) return res; // もうリトライしない（呼び出し側で res.ok 判定）
+    const backoff = base * Math.pow(2, attempt) + Math.floor(Math.random() * 250);
+    await sleep(backoff);
+    attempt++;
+  }
+}
+
+/** 任意の非同期関数に 429/5xx リトライを付与（Threads API 呼び出し用） */
+async function requestWithRetry(fn, { max = 4, base = 800 } = {}) {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await fn();
+    } catch (e) {
+      const msg = String(e?.message || e);
+      if (!/429|5\d\d/.test(msg) || attempt >= max) throw e;
+      const backoff = base * Math.pow(2, attempt) + Math.floor(Math.random() * 250);
+      await sleep(backoff);
+      attempt++;
+    }
+  }
+}
 
 /** "HH:MM[:SS]" → 分（0〜1439）に変換。null/空は全時間帯扱いとして null を返す */
 function timeToMinutes(t) {
@@ -27,17 +59,9 @@ function isWithinWindowJST(tStart, tEnd, nowMin) {
   const s = timeToMinutes(tStart); // null 可
   const e = timeToMinutes(tEnd);   // null 可
   if (s === null || e === null) return true; // どちらか未設定→制限なし
-
-  if (s === e) {
-    // 24h許可（同値なら全時間帯扱い）
-    return true;
-  }
-  if (s < e) {
-    // 同日内（例: 06:00-12:00）
-    return nowMin >= s && nowMin < e;
-  }
-  // 夜跨ぎ（例: 22:00-03:00）
-  return nowMin >= s || nowMin < e;
+  if (s === e) return true; // 同値なら24h許可
+  if (s < e) return nowMin >= s && nowMin < e; // 同日内
+  return nowMin >= s || nowMin < e; // 夜跨ぎ
 }
 
 export default async function handler(req, res) {
@@ -57,13 +81,17 @@ export default async function handler(req, res) {
   try {
     const nowMin = nowMinutesJST();
 
+    // 一回のrunで処理するスケジュール数を抑制（ピーク抑止）
+    const MAX_PER_RUN = 5;
+
     // next_run <= now, active=true のスケジュールを取得
     const { data: due, error: err1 } = await supabase
       .from('schedules')
       .select('id, account_id, mode, interval_minutes, next_run')
       .lte('next_run', new Date().toISOString())
       .eq('active', true)
-      .limit(10);
+      .order('next_run', { ascending: true })
+      .limit(MAX_PER_RUN);
     if (err1) throw err1;
 
     const results = [];
@@ -94,29 +122,34 @@ export default async function handler(req, res) {
       if (mode === 'TEMPLATE' || mode === 'MIX' || mode === 'AI') {
         // 1) 未使用テンプレを1件ピック（使用履歴はDB側で記録される想定）
         const rpcUrl = process.env.SUPABASE_URL + '/rest/v1/rpc/pick_next_template';
-        const rpcRes = await fetch(rpcUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            apikey: process.env.SUPABASE_SERVICE_ROLE,
-            Authorization: 'Bearer ' + process.env.SUPABASE_SERVICE_ROLE,
+        const rpcRes = await safeFetch(
+          rpcUrl,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              apikey: process.env.SUPABASE_SERVICE_ROLE,
+              Authorization: 'Bearer ' + process.env.SUPABASE_SERVICE_ROLE,
+            },
+            body: JSON.stringify({ _account_id: acct.id }),
           },
-          body: JSON.stringify({ _account_id: acct.id }),
-        });
+          { max: 4, base: 800 }
+        );
         if (!rpcRes.ok)
           throw new Error('pick_next_template failed: ' + (await rpcRes.text()));
 
         const templateId = await rpcRes.json();
 
         // 2) テンプレ取得（time_start/time_end も一緒に取る）
-        const tRes = await fetch(
+        const tRes = await safeFetch(
           `${process.env.SUPABASE_URL}/rest/v1/templates?id=eq.${templateId}`,
           {
             headers: {
               apikey: process.env.SUPABASE_SERVICE_ROLE,
               Authorization: 'Bearer ' + process.env.SUPABASE_SERVICE_ROLE,
             },
-          }
+          },
+          { max: 4, base: 800 }
         );
         const arr = await tRes.json();
         const tpl = Array.isArray(arr) ? arr[0] : arr;
@@ -130,18 +163,20 @@ export default async function handler(req, res) {
             result: { reason: 'template_not_found' },
             ok: true,
           });
+          // 次回は少しジッターを加えて衝突回避
+          const jitterMs = Math.floor(Math.random() * 30000); // 0〜30秒
           await supabase
             .from('schedules')
             .update({
               last_run: new Date().toISOString(),
-              next_run: new Date(Date.now() + sch.interval_minutes * 60 * 1000).toISOString(),
+              next_run: new Date(Date.now() + sch.interval_minutes * 60 * 1000 + jitterMs).toISOString(),
             })
             .eq('id', sch.id);
           results.push({ schedule: sch.id, ok: true, skipped: true, reason: 'template_not_found' });
           continue;
         }
 
-        // 4) 時間帯フィルタ（time_start/time_end は time 型を想定、文字列 "HH:MM:SS" が来る）
+        // 4) 時間帯フィルタ（time_start/time_end は time 型想定）
         const okWindow = isWithinWindowJST(tpl.time_start, tpl.time_end, nowMin);
         if (!okWindow) {
           await supabase.from('logs').insert({
@@ -156,11 +191,12 @@ export default async function handler(req, res) {
             result: { reason: 'out_of_time_window' },
             ok: true,
           });
+          const jitterMs = Math.floor(Math.random() * 30000);
           await supabase
             .from('schedules')
             .update({
               last_run: new Date().toISOString(),
-              next_run: new Date(Date.now() + sch.interval_minutes * 60 * 1000).toISOString(),
+              next_run: new Date(Date.now() + sch.interval_minutes * 60 * 1000 + jitterMs).toISOString(),
             })
             .eq('id', sch.id);
           results.push({
@@ -185,22 +221,26 @@ export default async function handler(req, res) {
         if (mode !== 'TEMPLATE' && process.env.OPENAI_API_KEY) {
           try {
             const prompt = `次の内容を参考に、Threads向けに自然で短めの日本語ポストを1つ生成してください。禁止: 個人情報、誹謗中傷、差別。\n\n参考:\n${text}\n`;
-            const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-              method: 'POST',
-              headers: {
-                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-                'Content-Type': 'application/json',
+            const resp = await safeFetch(
+              'https://api.openai.com/v1/chat/completions',
+              {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  model: 'gpt-4o-mini',
+                  messages: [
+                    { role: 'system', content: 'You are a concise Japanese copywriter for social media.' },
+                    { role: 'user', content: prompt },
+                  ],
+                  temperature: 0.7,
+                  max_tokens: 120,
+                }),
               },
-              body: JSON.stringify({
-                model: 'gpt-4o-mini',
-                messages: [
-                  { role: 'system', content: 'You are a concise Japanese copywriter for social media.' },
-                  { role: 'user', content: prompt },
-                ],
-                temperature: 0.7,
-                max_tokens: 120,
-              }),
-            });
+              { max: 3, base: 800 }
+            );
             const json = await resp.json();
             const ai = json?.choices?.[0]?.message?.content?.trim();
             if (ai) text = ai;
@@ -215,29 +255,32 @@ export default async function handler(req, res) {
       if (!dryRun) {
         try {
           if (mediaUrls.length > 0) {
-            // 複数画像：順にアップして最後を publish
+            // 複数画像：順にアップして最後を publish（各リクエスト間に待機）
             let lastContainer = null;
+
             for (const [i, url] of mediaUrls.entries()) {
-              const cont = await createImageContainer({
-                accessToken: acct.access_token,
-                text: i === 0 ? text : '', // 最初のメディアにだけ本文を付与
-                imageUrl: url,
-              });
-              lastContainer = cont;
+              lastContainer = await requestWithRetry(() =>
+                createImageContainer({
+                  accessToken: acct.access_token,
+                  text: i === 0 ? text : '', // 最初のメディアにだけ本文を付与
+                  imageUrl: url,
+                })
+              );
+              // スロットリング：1.2〜1.8秒待機
+              await sleep(1200 + Math.floor(Math.random() * 600));
             }
+
             if (lastContainer) {
-              const pub = await publish({
-                accessToken: acct.access_token,
-                creationId: lastContainer.id,
-              });
+              const pub = await requestWithRetry(() =>
+                publish({ accessToken: acct.access_token, creationId: lastContainer.id })
+              );
               postResult = { published: pub };
             }
           } else {
             // テキストのみ（auto_publish_text=true）
-            const r = await createTextAndMaybePublish({
-              accessToken: acct.access_token,
-              text,
-            });
+            const r = await requestWithRetry(() =>
+              createTextAndMaybePublish({ accessToken: acct.access_token, text })
+            );
             postResult = r;
           }
         } catch (e) {
@@ -249,12 +292,13 @@ export default async function handler(req, res) {
             result: { error: e?.message || String(e) },
             ok: false,
           });
-          // 次回へ
+          // 次回へ（ジッター付き）
+          const jitterMs = Math.floor(Math.random() * 30000);
           await supabase
             .from('schedules')
             .update({
               last_run: new Date().toISOString(),
-              next_run: new Date(Date.now() + sch.interval_minutes * 60 * 1000).toISOString(),
+              next_run: new Date(Date.now() + sch.interval_minutes * 60 * 1000 + jitterMs).toISOString(),
             })
             .eq('id', sch.id);
 
@@ -276,12 +320,13 @@ export default async function handler(req, res) {
         ok: true,
       });
 
-      // 次回実行時刻を更新
+      // 次回実行時刻を更新（ジッター付きで衝突回避）
+      const jitterMs = Math.floor(Math.random() * 30000); // 0〜30秒
       await supabase
         .from('schedules')
         .update({
           last_run: new Date().toISOString(),
-          next_run: new Date(Date.now() + sch.interval_minutes * 60 * 1000).toISOString(),
+          next_run: new Date(Date.now() + sch.interval_minutes * 60 * 1000 + jitterMs).toISOString(),
         })
         .eq('id', sch.id);
 
