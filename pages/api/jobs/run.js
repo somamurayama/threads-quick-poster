@@ -1,9 +1,44 @@
 // pages/api/jobs/run.js
-// 自動投稿ジョブ（Threads 複数画像 + 時間帯フィルタ対応）
+// 自動投稿ジョブ（Threads 複数画像 + 時間帯フィルタ[time_start/time_end]対応）
 // 使い方: https://<あなたのURL>/api/jobs/run?key=YOUR_SECRET[&dry=1]
 
 import { supabase } from '../../../lib/db.js';
 import { createTextAndMaybePublish, createImageContainer, publish } from '../../../lib/threadsApi.js';
+
+/** "HH:MM[:SS]" → 分（0〜1439）に変換。null/空は全時間帯扱いとして null を返す */
+function timeToMinutes(t) {
+  if (!t || typeof t !== 'string') return null;
+  const [hh, mm = '0'] = t.split(':');
+  const h = Math.max(0, Math.min(23, parseInt(hh, 10)));
+  const m = Math.max(0, Math.min(59, parseInt(mm, 10)));
+  return h * 60 + m;
+}
+
+/** JST 現在分（0〜1439） */
+function nowMinutesJST() {
+  const now = new Date();
+  const h = (now.getUTCHours() + 9 + 24) % 24;
+  const m = now.getUTCMinutes();
+  return h * 60 + m;
+}
+
+/** [start,end) の半開区間で判定。夜跨ぎ(例: 22:00-03:00)も対応。start/endがnullなら常時OK */
+function isWithinWindowJST(tStart, tEnd, nowMin) {
+  const s = timeToMinutes(tStart); // null 可
+  const e = timeToMinutes(tEnd);   // null 可
+  if (s === null || e === null) return true; // どちらか未設定→制限なし
+
+  if (s === e) {
+    // 24h許可（同値なら全時間帯扱い）
+    return true;
+  }
+  if (s < e) {
+    // 同日内（例: 06:00-12:00）
+    return nowMin >= s && nowMin < e;
+  }
+  // 夜跨ぎ（例: 22:00-03:00）
+  return nowMin >= s || nowMin < e;
+}
 
 export default async function handler(req, res) {
   if (req.method !== 'GET' && req.method !== 'POST')
@@ -20,11 +55,9 @@ export default async function handler(req, res) {
   const dryRun = String(req.query.dry || '') === '1';
 
   try {
-    // いまのJST時刻（UTC+9）の「時」だけ取り出す（0-23）
-    const now = new Date();
-    const hourJST = (now.getUTCHours() + 9) % 24;
+    const nowMin = nowMinutesJST();
 
-    // next_run <= now, active=true のスケジュールをまとめて取得
+    // next_run <= now, active=true のスケジュールを取得
     const { data: due, error: err1 } = await supabase
       .from('schedules')
       .select('id, account_id, mode, interval_minutes, next_run')
@@ -36,7 +69,7 @@ export default async function handler(req, res) {
     const results = [];
 
     for (const sch of due || []) {
-      // 対象アカウントを取得（無効化されていたらスキップ）
+      // アカウント取得（無効ならスキップ）
       const { data: acct, error: err2 } = await supabase
         .from('accounts')
         .select('id, threads_user_id, access_token, proxy_url, enabled')
@@ -53,13 +86,13 @@ export default async function handler(req, res) {
         continue;
       }
 
-      // 投稿内容の決定（TEMPLATE/MIX/AI）
+      // 投稿内容の決定
       const mode = (sch.mode || 'TEMPLATE').toUpperCase();
       let text = '';
-      let mediaUrls = []; // 複数URL対応（tpl.media_url を分解）
+      let mediaUrls = []; // 複数URL対応
 
       if (mode === 'TEMPLATE' || mode === 'MIX' || mode === 'AI') {
-        // 1) 未使用テンプレを1件ピック（使用履歴はDB側で記録）
+        // 1) 未使用テンプレを1件ピック（使用履歴はDB側で記録される想定）
         const rpcUrl = process.env.SUPABASE_URL + '/rest/v1/rpc/pick_next_template';
         const rpcRes = await fetch(rpcUrl, {
           method: 'POST',
@@ -75,80 +108,72 @@ export default async function handler(req, res) {
 
         const templateId = await rpcRes.json();
 
-        // 2) そのテンプレを「時間帯で」フィルタして取得
-        //    ・start_hour <= hourJST <= end_hour の範囲に合うものだけ取得
-        //    ・start_hour/end_hour が無い古い行はフォールバックとして後で手動チェック
-        let tUrl =
-          `${process.env.SUPABASE_URL}/rest/v1/templates` +
-          `?id=eq.${templateId}&start_hour=lte.${hourJST}&end_hour=gte.${hourJST}`;
-        let tRes = await fetch(tUrl, {
-          headers: {
-            apikey: process.env.SUPABASE_SERVICE_ROLE,
-            Authorization: 'Bearer ' + process.env.SUPABASE_SERVICE_ROLE,
-          },
-        });
-        let arr = await tRes.json();
-        let tpl = Array.isArray(arr) ? arr[0] : arr;
-
-        // 3) もし start_hour / end_hour カラムが存在しない or 値未設定でヒットしない場合のフォールバック
-        if (!tpl) {
-          const tRes2 = await fetch(
-            `${process.env.SUPABASE_URL}/rest/v1/templates?id=eq.${templateId}`,
-            {
-              headers: {
-                apikey: process.env.SUPABASE_SERVICE_ROLE,
-                Authorization: 'Bearer ' + process.env.SUPABASE_SERVICE_ROLE,
-              },
-            }
-          );
-          const arr2 = await tRes2.json();
-          const tpl2 = Array.isArray(arr2) ? arr2[0] : arr2;
-          if (tpl2) {
-            // start_hour/end_hour が無ければ 0-23 とみなす
-            const sh = Number.isInteger(tpl2.start_hour) ? tpl2.start_hour : 0;
-            const eh = Number.isInteger(tpl2.end_hour) ? tpl2.end_hour : 23;
-            if (sh <= hourJST && hourJST <= eh) {
-              tpl = tpl2; // 時間帯OKなので採用
-            }
+        // 2) テンプレ取得（time_start/time_end も一緒に取る）
+        const tRes = await fetch(
+          `${process.env.SUPABASE_URL}/rest/v1/templates?id=eq.${templateId}`,
+          {
+            headers: {
+              apikey: process.env.SUPABASE_SERVICE_ROLE,
+              Authorization: 'Bearer ' + process.env.SUPABASE_SERVICE_ROLE,
+            },
           }
-        }
+        );
+        const arr = await tRes.json();
+        const tpl = Array.isArray(arr) ? arr[0] : arr;
 
-        // 4) この時間帯で使えるテンプレが無い → スキップ（次回へ）
+        // 3) 存在しない → スキップ
         if (!tpl) {
-          // スキップ記録だけ残して次回時刻を進める
-          await supabase
-            .from('logs')
-            .insert({
-              account_id: acct.id,
-              action: 'SKIP',
-              payload: { schedule_id: sch.id, hourJST },
-              result: { reason: 'no_template_in_time_window' },
-              ok: true,
-            });
-
+          await supabase.from('logs').insert({
+            account_id: acct.id,
+            action: 'SKIP',
+            payload: { schedule_id: sch.id },
+            result: { reason: 'template_not_found' },
+            ok: true,
+          });
           await supabase
             .from('schedules')
             .update({
               last_run: new Date().toISOString(),
-              next_run: new Date(
-                Date.now() + sch.interval_minutes * 60 * 1000
-              ).toISOString(),
+              next_run: new Date(Date.now() + sch.interval_minutes * 60 * 1000).toISOString(),
             })
             .eq('id', sch.id);
+          results.push({ schedule: sch.id, ok: true, skipped: true, reason: 'template_not_found' });
+          continue;
+        }
 
+        // 4) 時間帯フィルタ（time_start/time_end は time 型を想定、文字列 "HH:MM:SS" が来る）
+        const okWindow = isWithinWindowJST(tpl.time_start, tpl.time_end, nowMin);
+        if (!okWindow) {
+          await supabase.from('logs').insert({
+            account_id: acct.id,
+            action: 'SKIP',
+            payload: {
+              schedule_id: sch.id,
+              nowMin,
+              time_start: tpl.time_start || null,
+              time_end: tpl.time_end || null,
+            },
+            result: { reason: 'out_of_time_window' },
+            ok: true,
+          });
+          await supabase
+            .from('schedules')
+            .update({
+              last_run: new Date().toISOString(),
+              next_run: new Date(Date.now() + sch.interval_minutes * 60 * 1000).toISOString(),
+            })
+            .eq('id', sch.id);
           results.push({
             schedule: sch.id,
             ok: true,
             skipped: true,
-            reason: 'no_template_in_time_window',
+            reason: 'out_of_time_window',
           });
-          continue; // 投稿処理に進まない
+          continue;
         }
 
-        // テンプレ本文
+        // 5) 本文・メディア
         text = tpl.body || '（本文なし）';
-
-        // media_url に複数URLが入っていたら分割（改行/カンマ/スペース）
         if (tpl.media_url) {
           mediaUrls = tpl.media_url
             .split(/[\n, ]+/)
@@ -156,7 +181,7 @@ export default async function handler(req, res) {
             .filter((u) => u.length > 0);
         }
 
-        // 5) AIモードなら上書き生成（任意）
+        // 6) AIモードなら上書き生成（任意）
         if (mode !== 'TEMPLATE' && process.env.OPENAI_API_KEY) {
           try {
             const prompt = `次の内容を参考に、Threads向けに自然で短めの日本語ポストを1つ生成してください。禁止: 個人情報、誹謗中傷、差別。\n\n参考:\n${text}\n`;
@@ -169,10 +194,7 @@ export default async function handler(req, res) {
               body: JSON.stringify({
                 model: 'gpt-4o-mini',
                 messages: [
-                  {
-                    role: 'system',
-                    content: 'You are a concise Japanese copywriter for social media.',
-                  },
+                  { role: 'system', content: 'You are a concise Japanese copywriter for social media.' },
                   { role: 'user', content: prompt },
                 ],
                 temperature: 0.7,
@@ -193,7 +215,7 @@ export default async function handler(req, res) {
       if (!dryRun) {
         try {
           if (mediaUrls.length > 0) {
-            // 複数画像：順にアップして最後をpublish
+            // 複数画像：順にアップして最後を publish
             let lastContainer = null;
             for (const [i, url] of mediaUrls.entries()) {
               const cont = await createImageContainer({
@@ -223,7 +245,7 @@ export default async function handler(req, res) {
           await supabase.from('logs').insert({
             account_id: acct.id,
             action: 'POST',
-            payload: { text, mediaUrls, schedule_id: sch.id, hourJST },
+            payload: { text, mediaUrls, schedule_id: sch.id, nowMin },
             result: { error: e?.message || String(e) },
             ok: false,
           });
@@ -232,9 +254,7 @@ export default async function handler(req, res) {
             .from('schedules')
             .update({
               last_run: new Date().toISOString(),
-              next_run: new Date(
-                Date.now() + sch.interval_minutes * 60 * 1000
-              ).toISOString(),
+              next_run: new Date(Date.now() + sch.interval_minutes * 60 * 1000).toISOString(),
             })
             .eq('id', sch.id);
 
@@ -251,7 +271,7 @@ export default async function handler(req, res) {
       await supabase.from('logs').insert({
         account_id: acct.id,
         action: 'POST',
-        payload: { text, mediaUrls, schedule_id: sch.id, hourJST },
+        payload: { text, mediaUrls, schedule_id: sch.id, nowMin },
         result: postResult || { dry: true },
         ok: true,
       });
@@ -261,9 +281,7 @@ export default async function handler(req, res) {
         .from('schedules')
         .update({
           last_run: new Date().toISOString(),
-          next_run: new Date(
-            Date.now() + sch.interval_minutes * 60 * 1000
-          ).toISOString(),
+          next_run: new Date(Date.now() + sch.interval_minutes * 60 * 1000).toISOString(),
         })
         .eq('id', sch.id);
 
